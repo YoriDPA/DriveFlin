@@ -1,6 +1,7 @@
 import { GoogleDrive } from './gdrive';
 import { Cipher } from '@fyears/rclone-crypt';
 import { toValidUuid } from './index';
+import { probeDriveMkv } from './mkvprobe';
 
 // Sync a single series folder directly into the DB (no self-fetch needed)
 async function syncSeriesFolder(env: any, gdrive: any, rc: any, libraryId: string, seriesId: string, seriesFolderId: string, seenIds: string[]) {
@@ -171,7 +172,10 @@ async function enrichTmdb(env: any, budget: any, maxItems: number) {
         budget.take(1);
         const tmdbDet = await getTmdbDetails(env.TMDB_API_KEY, searchRes.id, row.Type);
         if (tmdbDet) {
+          let existingInfo: any = {};
+          try { existingInfo = row.MediaInfo ? JSON.parse(row.MediaInfo) : {}; } catch (e) {}
           const mediaInfoStr = JSON.stringify({
+            ...existingInfo,
             tmdb: {
               id: tmdbDet.id,
               title: tmdbDet.title,
@@ -218,6 +222,46 @@ async function enrichTmdb(env: any, budget: any, maxItems: number) {
   }
 }
 
+async function probeTracks(env: any, gdrive: any, budget: any, maxItems: number) {
+  if (maxItems <= 0) return;
+  try {
+    const rows = (await env.DB.prepare(
+      `SELECT Id, FileId, Name, EncryptedName, MediaInfo FROM Items
+       WHERE (Type = 'Movie' OR Type = 'Episode') AND FileId IS NOT NULL
+         AND (MediaInfo IS NULL OR MediaInfo NOT LIKE '%"probed_by"%')
+       LIMIT ?`
+    ).bind(maxItems).all()).results || [];
+    if (!rows.length) return;
+    const token = await gdrive.getAccessToken();
+    console.log(`[probe] lendo faixas de ${rows.length} arquivos...`);
+    for (const row of rows) {
+      if (budget.left() < 3) break;
+      let info: any = {};
+      try { info = row.MediaInfo ? JSON.parse(row.MediaInfo) : {}; } catch (e) {}
+      const fileName = String(row.EncryptedName || row.Name || "");
+      let result: any = null;
+      if (/\.mkv$/i.test(fileName)) {
+        try {
+          result = await probeDriveMkv(token, row.FileId, () => budget.take(1));
+        } catch (err) {
+          if (err instanceof BudgetExceeded) throw err;
+          console.error(`[probe] falha em ${fileName}: ${(err as any)?.message || err}`);
+        }
+      }
+      if (result) {
+        info.format = { ...(info.format || {}), ...result.format };
+        info.streams = result.streams;
+      } else {
+        info.format = { ...(info.format || {}), probed_by: "driveflin-mkvprobe", probe_failed: true };
+      }
+      await env.DB.prepare("UPDATE Items SET MediaInfo = ? WHERE Id = ?").bind(JSON.stringify(info), row.Id).run();
+    }
+  } catch (err) {
+    if (err instanceof BudgetExceeded) return;
+    console.error(`[probe] erro: ${(err as any)?.message || err}`);
+  }
+}
+
 async function cleanupLibrary(env: any, libraryId: string, seenIds: string[]) {
   if (!seenIds.length) return;
   const allLibItems: any = await env.DB.prepare("SELECT Id FROM Items WHERE LibraryId = ?").bind(libraryId).all();
@@ -252,9 +296,12 @@ export async function runSync(env: any) {
     budget.take(1); // renovação do token do Google
   } catch (e) {}
 
-  // 1) Capas/sinopses primeiro, com até metade do orçamento (2 chamadas por item).
-  const enrichItems = Math.min(50, Math.floor((budget.left() / 2) / 2));
+  // 1) Capas/sinopses primeiro, com até 1/4 do orçamento (2 chamadas por item).
+  const enrichItems = Math.min(50, Math.floor((budget.left() / 4) / 2));
   await enrichTmdb(env, budget, enrichItems);
+
+  // 1b) Faixas de áudio/legenda dos MKV (idiomas), com até 1/4 do orçamento.
+  await probeTracks(env, gdrive, budget, Math.min(50, Math.floor(budget.left() / 3)));
 
   // 2) Bibliotecas, continuando de onde parou na rodada anterior.
   const { results } = await env.DB.prepare("SELECT * FROM Libraries ORDER BY Id").all();
@@ -359,9 +406,12 @@ export async function runSync(env: any) {
     }
   }
 
-  // 3) Sobrou orçamento? Usa para mais capas.
+  // 3) Sobrou orçamento? Usa para mais capas e mais leitura de faixas.
   if (budget.left() >= 4) {
-    await enrichTmdb(env, budget, Math.min(50, Math.floor(budget.left() / 2)));
+    await enrichTmdb(env, budget, Math.min(50, Math.floor(budget.left() / 4)));
+  }
+  if (budget.left() >= 4) {
+    await probeTracks(env, gdrive, budget, Math.min(100, Math.floor(budget.left() / 1.5)));
   }
 
   return { success: true };
