@@ -91,11 +91,149 @@ async function syncMovieFolder(env: any, gdrive: any, rc: any, libraryId: string
         }
       }
     } catch (err) {
-      console.error(`Error syncing movie item:`, err);
+      if (err instanceof BudgetExceeded) throw err;
+      (seenIds as any).__hadError = true;
+      console.error(`Error syncing movie item: ${(err as any)?.message || err}`);
     }
   }
   if (depth === 0 && pending.length) await env.DB.batch(pending.splice(0, pending.length));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sincronização com orçamento de subrequisições + retomada (YoriDPA)
+//
+// No plano grátis da Cloudflare cada execução só pode fazer ~50 subrequisições.
+// Antes, a sync recomeçava sempre da primeira biblioteca, travava no mesmo ponto
+// e podia apagar itens "não vistos". Agora:
+//  - conta as chamadas ao Drive/TMDB e para ANTES de estourar o limite;
+//  - guarda no KV onde parou (biblioteca + série) e continua na próxima rodada;
+//  - só apaga itens antigos quando a biblioteca foi lida INTEIRA, sem erros,
+//    numa única rodada (nunca apaga por causa de limite ou falha);
+//  - busca capas/sinopses (TMDB) primeiro, com parte do orçamento, para elas
+//    irem chegando mesmo quando as bibliotecas são grandes.
+// Ajuste opcional: variável SYNC_MAX_SUBREQUESTS (padrão 40; no plano pago use 900).
+// ─────────────────────────────────────────────────────────────────────────────
+
+class BudgetExceeded extends Error {
+  constructor() { super("sync budget exceeded"); this.name = "BudgetExceeded"; }
+}
+
+function makeBudget(env: any) {
+  const parsed = parseInt(String(env.SYNC_MAX_SUBREQUESTS ?? "").trim(), 10);
+  const limit = Number.isFinite(parsed) && parsed > 0 ? parsed : 40;
+  let used = 0;
+  return {
+    limit,
+    take(n: number = 1) {
+      if (used + n > limit) throw new BudgetExceeded();
+      used += n;
+    },
+    left() { return limit - used; },
+    get used() { return used; },
+  };
+}
+
+const SYNC_CURSOR_KEY = "sync_cursor_v1";
+
+async function readCursor(env: any): Promise<{ lib?: string; idx?: number }> {
+  try {
+    if (env.DRIVEFLIN_CONFIG?.get) {
+      const raw = await env.DRIVEFLIN_CONFIG.get(SYNC_CURSOR_KEY);
+      if (raw) return JSON.parse(raw);
+    }
+  } catch (e) {}
+  return {};
+}
+
+async function writeCursor(env: any, cursor: { lib: string; idx: number }) {
+  try {
+    if (env.DRIVEFLIN_CONFIG?.put) await env.DRIVEFLIN_CONFIG.put(SYNC_CURSOR_KEY, JSON.stringify(cursor));
+  } catch (e) {
+    console.error("[sync] falha ao salvar cursor:", e);
+  }
+}
+
+async function enrichTmdb(env: any, budget: any, maxItems: number) {
+  if (maxItems <= 0) return;
+  try {
+    const { searchTmdb, getTmdbDetails } = await import('./tmdb');
+    const missingMetadata = await env.DB.prepare(
+      "SELECT * FROM Items WHERE TmdbId IS NULL AND (Type = 'Movie' OR Type = 'Series') LIMIT ?"
+    ).bind(maxItems).all();
+    const rows = missingMetadata.results || [];
+    if (!rows.length) return;
+    console.log(`Enriching up to ${rows.length} items with TMDB metadata...`);
+    for (const row of rows) {
+      if (budget.left() < 2) break;
+      budget.take(1);
+      const searchRes = await searchTmdb(env.TMDB_API_KEY, row.Name, row.Type);
+      if (searchRes) {
+        budget.take(1);
+        const tmdbDet = await getTmdbDetails(env.TMDB_API_KEY, searchRes.id, row.Type);
+        if (tmdbDet) {
+          const mediaInfoStr = JSON.stringify({
+            tmdb: {
+              id: tmdbDet.id,
+              title: tmdbDet.title,
+              overview: tmdbDet.overview,
+              tagline: tmdbDet.tagline,
+              genres: tmdbDet.genres,
+              people: tmdbDet.people,
+              studios: tmdbDet.studios,
+              voteAverage: tmdbDet.voteAverage,
+              releaseDate: tmdbDet.releaseDate,
+              posterPath: tmdbDet.posterPath,
+              backdropPath: tmdbDet.backdropPath,
+            }
+          });
+          await env.DB.prepare(`
+            UPDATE Items SET
+              TmdbId = ?,
+              PrimaryImageFileId = COALESCE(PrimaryImageFileId, ?),
+              BackdropImageFileId = COALESCE(BackdropImageFileId, ?),
+              Overview = COALESCE(Overview, ?),
+              Name = ?,
+              MediaInfo = ?
+            WHERE Id = ?
+          `).bind(
+            searchRes.id,
+            tmdbDet.posterPath,
+            tmdbDet.backdropPath,
+            tmdbDet.overview,
+            tmdbDet.title || row.Name,
+            mediaInfoStr,
+            row.Id
+          ).run();
+        } else {
+          await env.DB.prepare("UPDATE Items SET TmdbId = ?, Name = ? WHERE Id = ?").bind(searchRes.id, searchRes.title || row.Name, row.Id).run();
+        }
+      } else {
+        // Não encontrado: marca para não tentar de novo toda hora.
+        await env.DB.prepare("UPDATE Items SET TmdbId = ? WHERE Id = ?").bind("-1", row.Id).run();
+      }
+    }
+  } catch (err) {
+    if (err instanceof BudgetExceeded) return;
+    console.error(`Error auto-fetching TMDB metadata: ${(err as any)?.message || err}`);
+  }
+}
+
+async function cleanupLibrary(env: any, libraryId: string, seenIds: string[]) {
+  if (!seenIds.length) return;
+  const allLibItems: any = await env.DB.prepare("SELECT Id FROM Items WHERE LibraryId = ?").bind(libraryId).all();
+  const seenSet = new Set(seenIds);
+  const toDelete = (allLibItems.results || []).map((r: any) => r.Id).filter((id: string) => !seenSet.has(id));
+  if (toDelete.length > 0) {
+    console.log(`Deleting ${toDelete.length} stale items from library ${libraryId}`);
+    for (let i = 0; i < toDelete.length; i += 50) {
+      const chunk = toDelete.slice(i, i + 50);
+      const chunkPlaceholders = chunk.map(() => '?').join(',');
+      await env.DB.prepare(`DELETE FROM Items WHERE Id IN (${chunkPlaceholders})`).bind(...chunk).run();
+    }
+  }
+}
+
+const isFolder = (f: any) => (f.shortcutDetails?.targetMimeType || f.mimeType) === 'application/vnd.google-apps.folder';
 
 export async function runSync(env: any) {
   const gdrive = new GoogleDrive(env);
@@ -105,155 +243,125 @@ export async function runSync(env: any) {
     await rc.key(env.RCLONE_PASS, env.RCLONE_SALT || '');
   }
 
-  const { results: libraries } = await env.DB.prepare("SELECT * FROM Libraries").all();
+  const budget = makeBudget(env);
+  // Cada listagem de pasta do Drive conta como 1 subrequisição.
+  const origList = gdrive.listFolder.bind(gdrive);
+  (gdrive as any).listFolder = async (id: string) => { budget.take(1); return origList(id); };
 
-  for (const lib of libraries) {
+  try {
+    budget.take(1); // renovação do token do Google
+  } catch (e) {}
+
+  // 1) Capas/sinopses primeiro, com até metade do orçamento (2 chamadas por item).
+  const enrichItems = Math.min(50, Math.floor((budget.left() / 2) / 2));
+  await enrichTmdb(env, budget, enrichItems);
+
+  // 2) Bibliotecas, continuando de onde parou na rodada anterior.
+  const { results } = await env.DB.prepare("SELECT * FROM Libraries ORDER BY Id").all();
+  const libraries: any[] = results || [];
+  if (!libraries.length) return { success: true };
+
+  const cursor = await readCursor(env);
+  let startPos = Math.max(0, libraries.findIndex((l) => l.Id === cursor.lib));
+  let startIdx = libraries[startPos]?.Id === cursor.lib ? Math.max(0, Number(cursor.idx) || 0) : 0;
+
+  for (let p = 0; p < libraries.length; p++) {
+    const pos = (startPos + p) % libraries.length;
+    const lib = libraries[pos];
+    const nextLib = libraries[(pos + 1) % libraries.length];
+    const idx0 = p === 0 ? startIdx : 0;
+    let progress = idx0;
+    let hadError = false;
+    const seenIds: string[] = [];
+
     try {
       const libraryId = lib.Id;
       const libraryFolderId = lib.FolderId;
-      if (!libraryFolderId) continue;
-      // Skip libraries that silently point to "root" when a Shared Drive is
-      // configured  - "root" + teamDriveId = entire Shared Drive, not intended.
-      if (libraryFolderId === "root" && gdrive.teamDriveId) continue;
+      if (!libraryFolderId || (libraryFolderId === "root" && gdrive.teamDriveId)) {
+        await writeCursor(env, { lib: nextLib.Id, idx: 0 });
+        continue;
+      }
 
       const isMovieLib = (lib.CollectionType === 'movies') || lib.Name.toLowerCase().includes('filme');
       const isTvLib = (lib.CollectionType === 'tvshows') || lib.Name.toLowerCase().includes('serie');
       const isMusicLib = (lib.CollectionType === 'music') || lib.Name.toLowerCase().includes('musica');
 
-      const topList: any = await gdrive.listFolder(libraryFolderId);
-      if (!topList || !topList.files) continue;
-
-      const seenIds: string[] = [];
-
       if (isTvLib) {
-        for (const seriesFolder of topList.files) {
-          if ((seriesFolder.shortcutDetails?.targetMimeType || seriesFolder.mimeType) !== 'application/vnd.google-apps.folder') continue;
-          let seriesName = seriesFolder.name;
-          try { seriesName = await rc.decryptFileName(seriesFolder.name); } catch(e) {}
-          if (/^S\d+/i.test(seriesName) || /^Season/i.test(seriesName) || /^Temporada/i.test(seriesName)) continue;
+        const topList: any = await gdrive.listFolder(libraryFolderId);
+        const seriesFolders = (topList?.files || [])
+          .filter(isFolder)
+          .sort((a: any, b: any) => String(a.name).localeCompare(String(b.name)));
 
-          const seriesId = `series_${(seriesFolder.shortcutDetails?.targetId || seriesFolder.id)}`;
+        for (let i = idx0; i < seriesFolders.length; i++) {
+          const seriesFolder = seriesFolders[i];
+          let seriesName = seriesFolder.name;
+          try { seriesName = await rc.decryptFileName(seriesFolder.name); } catch (e) {}
+          if (/^S\d+/i.test(seriesName) || /^Season/i.test(seriesName) || /^Temporada/i.test(seriesName)) { progress = i + 1; continue; }
+
+          const folderId = seriesFolder.shortcutDetails?.targetId || seriesFolder.id;
+          const seriesId = `series_${folderId}`;
           seenIds.push(seriesId);
-          
+
           await env.DB.prepare(`
             INSERT INTO Items (Id, ParentId, LibraryId, Type, Name, FolderId, Uuid)
             VALUES (?, ?, ?, 'Series', ?, ?, ?)
             ON CONFLICT(Id) DO UPDATE SET Name = CASE WHEN Items.TmdbId IS NULL THEN excluded.Name ELSE Items.Name END, FolderId = excluded.FolderId, Uuid = excluded.Uuid
-          `).bind(seriesId, libraryId, libraryId, seriesName, (seriesFolder.shortcutDetails?.targetId || seriesFolder.id), toValidUuid(seriesId)).run();
+          `).bind(seriesId, libraryId, libraryId, seriesName, folderId, toValidUuid(seriesId)).run();
 
-          await syncSeriesFolder(env, gdrive, rc, libraryId, seriesId, (seriesFolder.shortcutDetails?.targetId || seriesFolder.id), seenIds).catch(err => {
-            console.error(`Error syncing series ${seriesName}:`, err);
-          });
+          try {
+            await syncSeriesFolder(env, gdrive, rc, libraryId, seriesId, folderId, seenIds);
+          } catch (err) {
+            if (err instanceof BudgetExceeded) throw err;
+            hadError = true;
+            console.error(`Error syncing series ${seriesName}: ${(err as any)?.message || err}`);
+          }
+          progress = i + 1;
+          // Salva o progresso de tempos em tempos (se a execução for cortada, não perde tudo).
+          if (progress % 5 === 0) await writeCursor(env, { lib: lib.Id, idx: progress });
         }
       } else if (isMovieLib) {
         await syncMovieFolder(env, gdrive, rc, libraryId, libraryFolderId, seenIds);
       } else if (isMusicLib) {
-        for (const item of topList.files) {
+        const topList: any = await gdrive.listFolder(libraryFolderId);
+        for (const item of (topList?.files || [])) {
           try {
             let name = item.name;
-            try { name = await rc.decryptFileName(item.name); } catch(e) {}
+            try { name = await rc.decryptFileName(item.name); } catch (e) {}
             if (!name.match(/\.(mp3|flac|m4a|ogg|wav|aac)$/i)) continue;
             const rowId = `audio_${(item.shortcutDetails?.targetId || item.id)}`;
             seenIds.push(rowId);
-            
             await env.DB.prepare(`
               INSERT INTO Items (Id, ParentId, LibraryId, Type, Name, FileId, EncryptedName, Size, Uuid)
               VALUES (?, ?, ?, 'Audio', ?, ?, ?, ?, ?)
               ON CONFLICT(Id) DO UPDATE SET Name = CASE WHEN Items.TmdbId IS NULL THEN excluded.Name ELSE Items.Name END, Size = excluded.Size, FileId = excluded.FileId, EncryptedName = excluded.EncryptedName, Uuid = excluded.Uuid
             `).bind(rowId, libraryId, libraryId, name, (item.shortcutDetails?.targetId || item.id), item.name, item.size || 0, toValidUuid(rowId)).run();
           } catch (err) {
+            hadError = true;
             console.error(`Error syncing audio item:`, err);
           }
         }
       }
-      
-      // Cleanup items that are no longer in this library
-      if (seenIds.length > 0) {
-        const placeholders = seenIds.map(() => '?').join(',');
-        
-        // SQLite has a limit on parameters per query (usually 999 or 32766). 
-        // We can safely chunk it just in case, but usually a library has a few thousand items at most.
-        // Let's do a batch fetch of existing IDs and delete the missing ones to avoid limit issues.
-        const allLibItems: any = await env.DB.prepare("SELECT Id FROM Items WHERE LibraryId = ?").bind(libraryId).all();
-        const seenSet = new Set(seenIds);
-        const toDelete = (allLibItems.results || []).map((r: any) => r.Id).filter((id: string) => !seenSet.has(id));
-        
-        if (toDelete.length > 0) {
-          console.log(`Deleting ${toDelete.length} stale items from library ${libraryId}`);
-          // Chunk deletions
-          for (let i = 0; i < toDelete.length; i += 50) {
-            const chunk = toDelete.slice(i, i + 50);
-            const chunkPlaceholders = chunk.map(() => '?').join(',');
-            await env.DB.prepare(`DELETE FROM Items WHERE Id IN (${chunkPlaceholders})`).bind(...chunk).run();
-          }
-        }
-      }
 
+      // Só limpa quando a biblioteca foi lida inteira, do começo, sem erros.
+      if ((seenIds as any).__hadError) hadError = true;
+      if (idx0 === 0 && !hadError) {
+        await cleanupLibrary(env, libraryId, seenIds);
+      }
+      await writeCursor(env, { lib: nextLib.Id, idx: 0 });
     } catch (err) {
-      console.error(`Error syncing library ${lib.Id}:`, err);
+      if (err instanceof BudgetExceeded) {
+        console.log(`[sync] limite da rodada atingido em "${lib.Name}" (item ${progress}); continua na próxima.`);
+        await writeCursor(env, { lib: lib.Id, idx: progress });
+        break;
+      }
+      console.error(`Error syncing library ${lib.Id}: ${(err as any)?.message || err}`);
+      await writeCursor(env, { lib: nextLib.Id, idx: 0 });
     }
   }
 
-  // Background TMDB Metadata Enrichment
-  try {
-    console.log("Running background TMDB metadata enrichment...");
-    const { searchTmdb, getTmdbDetails } = await import('./tmdb');
-    
-    const missingMetadata = await env.DB.prepare("SELECT * FROM Items WHERE TmdbId IS NULL AND (Type = 'Movie' OR Type = 'Series') LIMIT 50").all();
-    
-    if (missingMetadata.results && missingMetadata.results.length > 0) {
-      console.log(`Enriching ${missingMetadata.results.length} items with TMDB metadata...`);
-      for (const row of missingMetadata.results) {
-         const searchRes = await searchTmdb(env.TMDB_API_KEY, row.Name, row.Type);
-         if (searchRes) {
-            const tmdbDet = await getTmdbDetails(env.TMDB_API_KEY, searchRes.id, row.Type);
-            if (tmdbDet) {
-                const mediaInfoStr = JSON.stringify({
-                  tmdb: {
-                    id: tmdbDet.id,
-                    title: tmdbDet.title,
-                    overview: tmdbDet.overview,
-                    tagline: tmdbDet.tagline,
-                    genres: tmdbDet.genres,
-                    people: tmdbDet.people,
-                    studios: tmdbDet.studios,
-                    voteAverage: tmdbDet.voteAverage,
-                    releaseDate: tmdbDet.releaseDate,
-                    posterPath: tmdbDet.posterPath,
-                    backdropPath: tmdbDet.backdropPath,
-                  }
-                });
-                
-                await env.DB.prepare(`
-                  UPDATE Items SET 
-                    TmdbId = ?, 
-                    PrimaryImageFileId = COALESCE(PrimaryImageFileId, ?), 
-                    BackdropImageFileId = COALESCE(BackdropImageFileId, ?),
-                    Overview = COALESCE(Overview, ?),
-                    Name = ?,
-                    MediaInfo = ?
-                  WHERE Id = ?
-                `).bind(
-                  searchRes.id, 
-                  tmdbDet.posterPath, 
-                  tmdbDet.backdropPath, 
-                  tmdbDet.overview,
-                  tmdbDet.title || row.Name,
-                  mediaInfoStr,
-                  row.Id
-                ).run();
-            } else {
-                // Fallback if details fail
-                await env.DB.prepare("UPDATE Items SET TmdbId = ?, Name = ? WHERE Id = ?").bind(searchRes.id, searchRes.title || row.Name, row.Id).run();
-            }
-         } else {
-            // Mark as searched so we don't retry every time in the next runs (could use a dummy TMDB ID like -1)
-            await env.DB.prepare("UPDATE Items SET TmdbId = ? WHERE Id = ?").bind("-1", row.Id).run();
-         }
-      }
-    }
-  } catch (err) {
-    console.error("Error auto-fetching TMDB metadata:", err);
+  // 3) Sobrou orçamento? Usa para mais capas.
+  if (budget.left() >= 4) {
+    await enrichTmdb(env, budget, Math.min(50, Math.floor(budget.left() / 2)));
   }
 
   return { success: true };
