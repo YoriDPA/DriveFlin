@@ -2547,7 +2547,7 @@ const parseMediaInfo = (row: any) => {
               const chLayout = s.channel_layout || (ch === 6 ? "5.1" : (ch === 1 ? "mono" : "stereo"));
               const chName = ch === 6 ? " 5.1" : (ch === 2 ? " Stereo" : "");
               const codecName = s.codec_name || "aac";
-              const isDefaultAudio = s.disposition?.default === 1 || s.index === 1 || s.index === 0;
+              const isDefaultAudio = s.disposition && typeof s.disposition.default === "number" ? s.disposition.default === 1 : (s.index === 1 || s.index === 0);
 
               return {
                 Codec: codecName,
